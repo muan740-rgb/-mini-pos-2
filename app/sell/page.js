@@ -3,6 +3,9 @@
 import { useState, useEffect } from 'react';
 import { supabase } from '../../lib/supabaseClient';
 
+// เกณฑ์แจ้งเตือนสต๊อกเหลือน้อย
+const LOW_STOCK_THRESHOLD = 5;
+
 export default function SellPage() {
   const [products, setProducts] = useState([]);
   const [cart, setCart] = useState([]);
@@ -108,6 +111,27 @@ export default function SellPage() {
     setCart(cart.filter((item) => item.id !== id));
   }
 
+  // ส่งแจ้งเตือนไป Telegram ผ่าน API Route ฝั่ง server
+  // ทำงานแบบ non-blocking: ถ้าพลาด จะแค่ log error ไว้ ไม่กระทบระบบขายที่ทำสำเร็จไปแล้ว
+  async function notifyTelegram(messages) {
+    if (!messages || messages.length === 0) return;
+
+    try {
+      const res = await fetch('/api/notify-telegram', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages }),
+      });
+
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        console.error('ส่งแจ้งเตือน Telegram ไม่สำเร็จ:', data.error || res.statusText);
+      }
+    } catch (error) {
+      console.error('ส่งแจ้งเตือน Telegram ไม่สำเร็จ:', error);
+    }
+  }
+
   // ยืนยันการขายและชำระเงิน
   async function handleCheckout() {
     if (cart.length === 0) {
@@ -121,6 +145,10 @@ export default function SellPage() {
 
     setSubmitting(true);
     const now = new Date().toISOString();
+    const thaiTime = new Date(now).toLocaleString('th-TH', {
+      dateStyle: 'medium',
+      timeStyle: 'short',
+    });
 
     try {
       // 1. เตรียมข้อมูลบันทึกลงตาราง sales
@@ -138,10 +166,13 @@ export default function SellPage() {
 
       if (salesError) throw salesError;
 
-      // 2. ตัดสต็อกสินค้าในตาราง products
+      // 2. ตัดสต็อกสินค้าในตาราง products พร้อมเตรียมข้อความแจ้งเตือน Telegram
+      const notifyMessages = [];
+
       for (const item of cart) {
         const product = products.find((p) => p.id === item.id);
         const updatedStock = product.stock - item.cartQty;
+        const itemTotal = Number(item.price) * item.cartQty;
 
         const { error: updateError } = await supabase
           .from('products')
@@ -149,7 +180,30 @@ export default function SellPage() {
           .eq('id', item.id);
 
         if (updateError) throw updateError;
+
+        // งานที่ 1: ข้อความแจ้งเตือน Order เข้าใหม่
+        notifyMessages.push(
+          `🛍️ <b>มีรายการขายใหม่!</b>\n` +
+            `สินค้า: ${item.name}\n` +
+            `จำนวน: ${item.cartQty} ชิ้น\n` +
+            `ราคารวม: ${itemTotal.toLocaleString()} บาท\n` +
+            `สต๊อกคงเหลือปัจจุบัน: ${updatedStock} ${item.unit}\n` +
+            `เวลา: ${thaiTime}`
+        );
+
+        // งานที่ 2: ข้อความแจ้งเตือน Stock เหลือน้อย (ถ้าหลังตัดแล้ว <= เกณฑ์)
+        if (updatedStock <= LOW_STOCK_THRESHOLD) {
+          notifyMessages.push(
+            `🚨 <b>[เตือนภัย] สต๊อกสินค้าใกล้หมด!</b>\n` +
+              `สินค้า: ${item.name}\n` +
+              `คงเหลือเพียง: ${updatedStock} ชิ้น\n` +
+              `⚠️ กรุณาเติมสต๊อกสินค้าด่วน!`
+          );
+        }
       }
+
+      // ยิงแจ้งเตือน Telegram แบบไม่บล็อกและไม่ทำให้การขายที่สำเร็จแล้วขัดข้อง
+      notifyTelegram(notifyMessages);
 
       alert('ทำรายการขายสำเร็จ!');
       setCart([]);
